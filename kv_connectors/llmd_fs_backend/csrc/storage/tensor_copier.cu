@@ -30,15 +30,19 @@
 // Constructor - initializes configuration
 TensorCopier::TensorCopier(std::vector<torch::Tensor>& tensors,
                            int gpu_blocks_per_file,
-                           int sub_blocks_per_gpu_block)
+                           int sub_blocks_per_gpu_block,
+                           int kernel_blocks_per_canonical_block)
     : m_gpu_blocks_per_file(gpu_blocks_per_file),
       m_sub_blocks_per_gpu_block(sub_blocks_per_gpu_block),
+      m_kernel_blocks_per_canonical_block(kernel_blocks_per_canonical_block),
       m_gpu_tensors(tensors) {
   TORCH_CHECK(!m_gpu_tensors.empty(), "TensorCopier: tensors is empty");
   TORCH_CHECK(m_gpu_blocks_per_file > 0,
               "TensorCopier: gpu_blocks_per_file must be > 0");
   TORCH_CHECK(m_sub_blocks_per_gpu_block > 0,
               "TensorCopier: sub_blocks_per_gpu_block must be > 0");
+  TORCH_CHECK(m_kernel_blocks_per_canonical_block >= 1,
+              "TensorCopier: kernel_blocks_per_canonical_block must be >= 1");
   m_tensor_block_size = tensors[0].stride(0) * tensors[0].element_size();
   TORCH_CHECK(m_tensor_block_size > 0,
               "TensorCopier: tensor block size must be > 0");
@@ -58,7 +62,8 @@ TensorCopier::TensorCopier(std::vector<torch::Tensor>& tensors,
   FS_LOG_DEBUG("TensorCopier: use_kernel_copy_read="
                << m_use_kernel_copy_read
                << ", use_kernel_copy_write=" << m_use_kernel_copy_write
-               << ", m_gpu_blocks_per_file=" << m_gpu_blocks_per_file);
+               << ", m_gpu_blocks_per_file=" << m_gpu_blocks_per_file
+               << ", kb_per_canonical=" << m_kernel_blocks_per_canonical_block);
 }
 
 // Performs block transfers using cudaMemcpyAsync (DMA-based copy)
@@ -129,29 +134,35 @@ void TensorCopier::copy_blocks_via_cuda_memcpy(
                     m_gpu_tensors.size() * m_tensor_sub_block_size;
 
   for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
-    int64_t gpu_block_idx = block_ids_list[bi];
+    const int64_t canonical_block_idx = block_ids_list[bi];
     const int64_t block_offset =
         use_partial_ranges ? (*block_offsets_list)[bi] : 0;
     const int64_t block_count =
         use_partial_ranges ? (*block_counts_list)[bi] : m_sub_blocks_per_gpu_block;
     const size_t block_copy_size =
         static_cast<size_t>(block_count) * m_tensor_sub_block_size;
-    // Process all layers for this block (for cross-layer layout is just one
-    // layer)
-    for (const auto& tensor : m_gpu_tensors) {
-      gpu_blk_ptr = reinterpret_cast<uint8_t*>(tensor.data_ptr()) +
-                    gpu_block_idx * m_tensor_block_size +
-                    static_cast<size_t>(block_offset) * m_tensor_sub_block_size;
-      // Perform async copy - returns immediately, transfers in background
-      cudaError_t err = cudaMemcpyAsync(*dst,
-                                        *src,
-                                        block_copy_size,
-                                        kind,
-                                        stream.stream());
-      TORCH_CHECK(err == cudaSuccess, "cudaMemcpyAsync failed");
 
-      // increment CPU block pointer to next block
-      cpu_blk_ptr += block_copy_size;
+    // When kernel_blocks_per_canonical_block > 1, each canonical
+    // block_id maps to multiple consecutive kernel blocks in GPU
+    // memory.  The staging buffer (and thus file) stores them
+    // contiguously per layer, making the on-disk layout
+    // independent of the runtime kernel block size.
+    for (int kb = 0; kb < m_kernel_blocks_per_canonical_block; ++kb) {
+      const int64_t gpu_block_idx =
+          canonical_block_idx * m_kernel_blocks_per_canonical_block + kb;
+      for (const auto& tensor : m_gpu_tensors) {
+        gpu_blk_ptr = reinterpret_cast<uint8_t*>(tensor.data_ptr()) +
+                      gpu_block_idx * m_tensor_block_size +
+                      static_cast<size_t>(block_offset) *
+                          m_tensor_sub_block_size;
+        cudaError_t err = cudaMemcpyAsync(*dst,
+                                          *src,
+                                          block_copy_size,
+                                          kind,
+                                          stream.stream());
+        TORCH_CHECK(err == cudaSuccess, "cudaMemcpyAsync failed");
+        cpu_blk_ptr += block_copy_size;
+      }
     }
   }
 }

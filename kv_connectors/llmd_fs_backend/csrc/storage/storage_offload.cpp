@@ -56,11 +56,14 @@ StorageOffloadEngine::StorageOffloadEngine(int io_threads,
                                            int gpu_blocks_per_file,
                                            std::vector<torch::Tensor>& tensors,
                                            int sub_blocks_per_gpu_block,
-                                           int read_preferring_workers)
+                                           int read_preferring_workers,
+                                           int kernel_blocks_per_canonical_block)
     : m_tensor_copier(
-          tensors, gpu_blocks_per_file, sub_blocks_per_gpu_block),
+          tensors, gpu_blocks_per_file, sub_blocks_per_gpu_block,
+          kernel_blocks_per_canonical_block),
       m_thread_pool(io_threads,
-                    calc_staging_bytes(gpu_blocks_per_file, tensors),
+                    calc_staging_bytes(gpu_blocks_per_file, tensors)
+                        * static_cast<size_t>(kernel_blocks_per_canonical_block),
                     get_device_id(),
                     read_preferring_workers) {}
 

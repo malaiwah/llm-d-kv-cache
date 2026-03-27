@@ -65,7 +65,8 @@ class StorageOffloadEngine {
                        int gpu_blocks_per_file,
                        std::vector<torch::Tensor>& tensors,
                        int sub_blocks_per_gpu_block,
-                       int read_preferring_workers);
+                       int read_preferring_workers,
+                       int kernel_blocks_per_canonical_block = 1);
   // Return finished jobs and their success status
   std::vector<std::pair<int, bool>> get_finished();
   // Wait for all tasks in the specified job to complete

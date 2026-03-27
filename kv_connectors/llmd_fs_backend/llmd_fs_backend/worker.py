@@ -453,12 +453,36 @@ class StorageOffloadingHandlers:
             read_preferring_workers = max(
                 1, int(group_threads * read_preferring_ratio)
             )
+            # Canonical block grouping: when the attention backend's
+            # kernel block size differs from the vLLM page size,
+            # group multiple kernel blocks into one canonical block
+            # so the on-disk format is page-aligned and portable
+            # across GPUs with different kernel block sizes.
+            kb_per_canonical = 1
+            if (
+                kernel_block_size != group_gpu_block_size
+                and group_gpu_block_size % kernel_block_size == 0
+            ):
+                kb_per_canonical = (
+                    group_gpu_block_size // kernel_block_size
+                )
+                logger.info(
+                    "Canonical grouping group=%s: %d kernel "
+                    "blocks per canonical block (kb=%d, "
+                    "page=%d)",
+                    group_index,
+                    kb_per_canonical,
+                    kernel_block_size,
+                    group_gpu_block_size,
+                )
+
             store_engine = storage_offload.StorageOffloadEngine(
                 io_threads=group_threads,
                 gpu_blocks_per_file=group_gpu_blocks_per_file,
                 tensors=tensors,
                 sub_blocks_per_gpu_block=group_gpu_block_size // group_hash_block_size,
                 read_preferring_workers=read_preferring_workers,
+                kernel_blocks_per_canonical_block=kb_per_canonical,
             )
             load_engine = storage_offload.StorageOffloadEngine(
                 io_threads=group_threads,
@@ -466,11 +490,12 @@ class StorageOffloadingHandlers:
                 tensors=tensors,
                 sub_blocks_per_gpu_block=group_gpu_block_size // group_hash_block_size,
                 read_preferring_workers=read_preferring_workers,
+                kernel_blocks_per_canonical_block=kb_per_canonical,
             )
-            # Compute expected file size from the actual tensors
-            # the C++ engine will use for staging.  We use
-            # kernel_blocks_per_file (factoring in the backend's
-            # kernel block size) rather than gpu_blocks_per_file.
+            # Expected file size: canonical blocks × bytes per
+            # canonical block.  Since kb_per_canonical folds the
+            # kernel block size into the canonical block, this
+            # size is deterministic across GPUs.
             sub_blocks_per_gpu_block = (
                 group_gpu_block_size // group_hash_block_size
             )
@@ -481,6 +506,7 @@ class StorageOffloadingHandlers:
                 group_gpu_blocks_per_file
                 * sub_blocks_per_gpu_block
                 * per_sub_block_bytes
+                * kb_per_canonical
             )
 
             logger.info(
@@ -605,14 +631,11 @@ class StorageOffloadingHandlers:
 
         assert kernel_block_size is not None
 
-        # NOTE: canonical tensor normalization was attempted here to
-        # make file sizes deterministic across kernel block sizes,
-        # but the reshape causes data corruption on cross-GPU loads
-        # because the read-side can't denormalize back to a different
-        # kernel block layout.  Proper cross-GPU portability requires
-        # the C++ TensorCopier to understand a canonical on-disk
-        # format and perform layout translation during load.
-        # For now, file size validation rejects mismatches and the
-        # scheduler falls back to recompute — safe but slower.
+        # Cross-GPU portability is handled in the C++ TensorCopier
+        # via kernel_blocks_per_canonical_block.  The Python side
+        # passes the grouping factor to the engine constructor;
+        # the C++ copy loop expands each canonical block_id into
+        # the appropriate number of kernel blocks for the local
+        # GPU's attention backend layout.
 
         return tensors, kernel_block_size

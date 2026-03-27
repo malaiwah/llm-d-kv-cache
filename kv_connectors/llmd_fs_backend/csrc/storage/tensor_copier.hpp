@@ -24,7 +24,8 @@ class TensorCopier {
  public:
   TensorCopier(std::vector<torch::Tensor>& tensors,
                int gpu_blocks_per_files,
-               int sub_blocks_per_gpu_block);
+               int sub_blocks_per_gpu_block,
+               int kernel_blocks_per_canonical_block = 1);
 
   // Main transfer function - dispatches to kernel or memcpy path
   void copy_blocks(uint8_t* cpu_base,
@@ -33,6 +34,16 @@ class TensorCopier {
                    const std::vector<int64_t>* block_counts_list,
                    bool is_store);
 
+  // Canonical block size in bytes (for file layout determinism).
+  // When kernel_blocks_per_canonical_block > 1, each block_id in
+  // the transfer maps to multiple consecutive kernel blocks in
+  // GPU memory.  Files are stored at canonical granularity.
+  size_t canonical_block_bytes() const {
+    return m_tensor_block_size *
+           static_cast<size_t>(m_kernel_blocks_per_canonical_block) *
+           m_gpu_tensors.size();
+  }
+
  private:
   // GPU tensor list
   std::vector<torch::Tensor> m_gpu_tensors;
@@ -40,6 +51,11 @@ class TensorCopier {
   int m_gpu_blocks_per_file;
   // Number of equal-sized sub-blocks contained in a GPU block.
   int m_sub_blocks_per_gpu_block;
+  // Number of kernel blocks that form one canonical (file) block.
+  // When > 1, each block_id in a transfer maps to this many
+  // consecutive kernel blocks in GPU memory, and the staging
+  // buffer / file layout uses the larger canonical size.
+  int m_kernel_blocks_per_canonical_block;
   // Size in bytes of one KV block
   size_t m_tensor_block_size;
   // Size in bytes of one sub-block.
