@@ -605,56 +605,14 @@ class StorageOffloadingHandlers:
 
         assert kernel_block_size is not None
 
-        # Normalize to a canonical block size so that file sizes are
-        # deterministic across restarts and GPU hardware.  Attention
-        # backends may use varying kernel block sizes (e.g. 32, 64,
-        # 128) depending on CUDAGraph warmup, but the vLLM page size
-        # (fallback_block_size, e.g. 1056) is always the same for a
-        # given model config.
-        #
-        # We flatten each tensor to 1D and reshape so that stride(0)
-        # equals exactly one vLLM page worth of bytes.  The C++
-        # TensorCopier uses stride(0) to determine how many bytes
-        # to copy per block — making this deterministic ensures
-        # identical file sizes across restarts and GPU architectures.
-        if (
-            kernel_block_size != fallback_block_size
-            and fallback_block_size % kernel_block_size == 0
-        ):
-            page_size = fallback_block_size
-            ratio = page_size // kernel_block_size
-            canonical = []
-            can_reshape = True
-            for t in tensors:
-                num_kernel_blocks = t.shape[0]
-                if num_kernel_blocks % ratio != 0:
-                    can_reshape = False
-                    break
-                num_pages = num_kernel_blocks // ratio
-                # Elements per kernel block = stride(0)
-                elems_per_kb = t.stride(0)
-                elems_per_page = elems_per_kb * ratio
-                # Flatten and reshape: [N_kb, elems_per_kb]
-                #   → [N_pages, elems_per_page]
-                # This works because the data is contiguous and we're
-                # just changing how many elements constitute a "block".
-                flat = t.reshape(num_kernel_blocks, elems_per_kb)
-                paged = flat.reshape(num_pages, elems_per_page)
-                canonical.append(paged)
-
-            if can_reshape:
-                logger.info(
-                    "Normalized %d tensors: kernel_block_size=%d "
-                    "-> canonical page_size=%d (ratio=%d, "
-                    "stride %d -> %d)",
-                    len(canonical),
-                    kernel_block_size,
-                    page_size,
-                    ratio,
-                    tensors[0].stride(0) if tensors else 0,
-                    canonical[0].stride(0) if canonical else 0,
-                )
-                tensors = canonical
-                kernel_block_size = page_size
+        # NOTE: canonical tensor normalization was attempted here to
+        # make file sizes deterministic across kernel block sizes,
+        # but the reshape causes data corruption on cross-GPU loads
+        # because the read-side can't denormalize back to a different
+        # kernel block layout.  Proper cross-GPU portability requires
+        # the C++ TensorCopier to understand a canonical on-disk
+        # format and perform layout translation during load.
+        # For now, file size validation rejects mismatches and the
+        # scheduler falls back to recompute — safe but slower.
 
         return tensors, kernel_block_size
